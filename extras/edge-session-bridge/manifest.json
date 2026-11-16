@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "BiliYT Session Bridge",
+  "version": "1.0.0",
+  "description": "把当前 Edge 中的 Bilibili 登录态安全交给本机 BiliYTPlayer。",
+  "permissions": ["cookies"],
+  "host_permissions": [
+    "https://*.bilibili.com/*",
+    "http://127.0.0.1:48129/*"
+  ],
+  "action": {
+    "default_title": "导入 Bilibili 登录态",
+    "default_popup": "popup.html"
+  }
+}

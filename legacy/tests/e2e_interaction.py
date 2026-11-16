@@ -27,8 +27,15 @@ import json, subprocess, time, os, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # tests/ 的上一级 = legacy/
-MPV = os.path.join(ROOT, "mpv-portable", "mpv.exe")
-CONF = os.path.join(ROOT, "mpv-portable", "portable_config")
+sys.path.insert(0, ROOT)
+import bili_clipboard_dolby as D
+
+# 发布包可用内置 mpv；源码仓库通常复用本机 MPV Anime。配置始终测试仓库
+# 的唯一事实来源 config/，避免不受 Git 管理的 portable_config 副本漂移。
+MPV = D.find_player()
+CONF = os.path.join(os.path.dirname(ROOT), "config")
+if not MPV:
+    raise SystemExit("未找到 mpv；请设置 BILIYT_MPV_PATH 后重试")
 VIDEO = sys.argv[1] if len(sys.argv) > 1 else "av://lavfi:testsrc=duration=600"
 TITLE = "E2E-CLICK-TEST"
 PIPE = f"\\\\.\\pipe\\mpv-e2e-{int(time.time())}"

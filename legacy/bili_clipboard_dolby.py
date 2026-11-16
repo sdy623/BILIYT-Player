@@ -3,7 +3,7 @@
 """
 bili_clipboard_dolby.py — BiliYTPlayer 后端核心库（由 bili_yt_player.pyw 调用）
 
-职责：B 站 API 鉴权（扫码登录 / WBI 签名）→ DASH 流提取与优选 →
+职责：B 站 API 鉴权（Edge / Firefox 登录态 / WBI 签名）→ DASH 流提取与优选 →
   构造参数唤起 mpv 播放；经 MPV 命名管道 IPC 实现切集与自动连播。
 
 不挑终端——UWP 客户端、Edge/Chrome 网页、微信/QQ 别人发的链接，复制即播。
@@ -17,11 +17,15 @@ import sys
 import re
 import time
 import json
+import base64
+import hmac
+import secrets
 import socket
 import hashlib
 import threading
 import subprocess
 import urllib.parse
+import sqlite3
 from functools import reduce
 from pathlib import Path
 from shutil import which
@@ -71,7 +75,6 @@ else:
     _exe_dir = Path(__file__).resolve().parent
 _CONFIG_DIR = Path(os.environ.get("APPDATA", str(_exe_dir))) / "BiliYTPlayer"
 _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-ENV_PATH = _CONFIG_DIR / ".env"
 
 def _install(pkg, imp=None):
     if imp is None:
@@ -92,9 +95,9 @@ def _install(pkg, imp=None):
 # PyInstaller 打包后依赖已随 exe bundle，无需（也无法）pip install
 if not getattr(sys, "frozen", False):
     _install("requests")
-    _install("python-dotenv", "dotenv")
     _install("pyperclip")
     _install("qrcode")
+    _install("cryptography")
 
 
 import requests  # noqa: E402
@@ -131,8 +134,337 @@ CODEC_WEIGHT = {13: 3, 12: 2, 7: 1}
 
 
 # ============================================================================
-# 2. SESSDATA 读取（QR 扫码登录，替代手工凭证）
+# 2. B 站登录态读取（仅 bilibili.com；只进内存）
 # ============================================================================
+
+class EdgeCookieUnsupported(RuntimeError):
+    """Edge 的 Cookie 使用当前实现不应绕过的保护方式。"""
+
+
+EDGE_BRIDGE_PORT = 48129
+_EDGE_BRIDGE_SERVER = None
+_EDGE_BRIDGE_TOKEN = None
+_EDGE_BRIDGE_SESSDATA = None
+_EDGE_BRIDGE_LOCK = threading.Lock()
+
+
+def start_edge_session_bridge(emit=None, port: int = EDGE_BRIDGE_PORT):
+    """启动仅监听 127.0.0.1 的 Edge 扩展接收端，返回一次性配对码。
+
+    Edge 127+ 默认使用 App-Bound 加密，普通桌面程序不应绕过。配套扩展通过
+    Edge 官方 cookies API 只读取 bilibili.com 的 SESSDATA，再用本次运行的
+    随机配对码交给此进程；值不写盘。
+    """
+    global _EDGE_BRIDGE_SERVER, _EDGE_BRIDGE_TOKEN
+    if _EDGE_BRIDGE_SERVER is not None:
+        return _EDGE_BRIDGE_TOKEN
+
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    token = secrets.token_urlsafe(24)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, _format, *_args):
+            return
+
+        def _allow_origin(self):
+            origin = self.headers.get("Origin", "")
+            return origin if origin.startswith("chrome-extension://") else None
+
+        def _cors(self, origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Cache-Control", "no-store")
+
+        def do_OPTIONS(self):
+            origin = self._allow_origin()
+            if not origin:
+                self.send_error(403)
+                return
+            self.send_response(204)
+            self._cors(origin)
+            self.send_header("Access-Control-Allow-Methods", "POST")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+
+        def do_POST(self):
+            global _EDGE_BRIDGE_SESSDATA
+            origin = self._allow_origin()
+            if self.path != "/biliyt-session" or not origin:
+                self.send_error(403)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 8192:
+                    raise ValueError("请求长度异常")
+                data = json.loads(self.rfile.read(length))
+                supplied = data.get("token", "")
+                sessdata = data.get("sessdata", "")
+                if not isinstance(supplied, str) or not hmac.compare_digest(supplied, token):
+                    self.send_error(403)
+                    return
+                if not isinstance(sessdata, str) or not (20 <= len(sessdata) <= 4096):
+                    raise ValueError("SESSDATA 格式异常")
+                with _EDGE_BRIDGE_LOCK:
+                    _EDGE_BRIDGE_SESSDATA = sessdata
+                self.send_response(204)
+                self._cors(origin)
+                self.end_headers()
+            except (ValueError, json.JSONDecodeError):
+                self.send_error(400)
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as exc:
+        if emit:
+            emit(f"[!] Edge 扩展桥接端口不可用：{exc}")
+        return None
+    server.daemon_threads = True
+    _EDGE_BRIDGE_SERVER = server
+    _EDGE_BRIDGE_TOKEN = token
+    threading.Thread(target=server.serve_forever, daemon=True,
+                     name="biliyt-edge-bridge").start()
+    return token
+
+
+def stop_edge_session_bridge():
+    global _EDGE_BRIDGE_SERVER, _EDGE_BRIDGE_TOKEN, _EDGE_BRIDGE_SESSDATA
+    server = _EDGE_BRIDGE_SERVER
+    _EDGE_BRIDGE_SERVER = None
+    _EDGE_BRIDGE_TOKEN = None
+    with _EDGE_BRIDGE_LOCK:
+        _EDGE_BRIDGE_SESSDATA = None
+    if server is not None:
+        server.shutdown()
+        server.server_close()
+
+
+def _edge_bridge_candidate():
+    with _EDGE_BRIDGE_LOCK:
+        value = _EDGE_BRIDGE_SESSDATA
+    if not value:
+        return []
+    return [(4_102_444_800, time.time(), value, "Edge 扩展")]
+
+
+def _firefox_sessdata_candidates(emit=None):
+    """读取 Firefox 中有效的 B 站 SESSDATA 候选项。"""
+    appdata = Path(os.environ.get("APPDATA", ""))
+    profiles_root = appdata / "Mozilla" / "Firefox" / "Profiles"
+    if not profiles_root.is_dir():
+        return []
+
+    now = int(time.time())
+    candidates = []
+    for db in profiles_root.glob("*/cookies.sqlite"):
+        try:
+            # URI 只读模式不会创建 journal/WAL，也不会修改浏览器资料。
+            con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+            try:
+                rows = con.execute(
+                    "SELECT value, expiry FROM moz_cookies "
+                    "WHERE name='SESSDATA' "
+                    "AND host IN ('.bilibili.com', 'bilibili.com', 'www.bilibili.com') "
+                    "ORDER BY expiry DESC"
+                ).fetchall()
+            finally:
+                con.close()
+            for value, expiry in rows:
+                if value and (not expiry or int(expiry) > now):
+                    candidates.append(
+                        (int(expiry or 0), db.stat().st_mtime, value,
+                         f"Firefox ({db.parent.name})")
+                    )
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            if emit:
+                emit(f"[*] 跳过无法读取的 Firefox 配置 {db.parent.name}: {exc}")
+    return candidates
+
+
+def _dpapi_unprotect(payload: bytes) -> bytes:
+    """使用当前 Windows 用户的 DPAPI 解开数据；明文只存在于进程内存。"""
+    if sys.platform != "win32":
+        raise OSError("DPAPI 仅适用于 Windows")
+
+    import ctypes
+    from ctypes import wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD),
+                    ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+    source = ctypes.create_string_buffer(payload)
+    source_blob = DATA_BLOB(
+        len(payload), ctypes.cast(source, ctypes.POINTER(ctypes.c_ubyte))
+    )
+    output_blob = DATA_BLOB()
+    crypt32 = ctypes.WinDLL("crypt32.dll", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
+    crypt32.CryptUnprotectData.argtypes = [
+        ctypes.POINTER(DATA_BLOB), ctypes.c_void_p,
+        ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p,
+        wintypes.DWORD, ctypes.POINTER(DATA_BLOB),
+    ]
+    crypt32.CryptUnprotectData.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    ok = crypt32.CryptUnprotectData(
+        ctypes.byref(source_blob), None, None, None, None, 0,
+        ctypes.byref(output_blob),
+    )
+    if not ok:
+        raise OSError(ctypes.get_last_error(), "CryptUnprotectData 失败")
+    try:
+        return ctypes.string_at(output_blob.pbData, output_blob.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(output_blob.pbData, ctypes.c_void_p))
+
+
+def _edge_master_key(user_data_root: Path) -> bytes:
+    state = json.loads((user_data_root / "Local State").read_text(encoding="utf-8"))
+    encoded = state.get("os_crypt", {}).get("encrypted_key")
+    if not encoded:
+        raise EdgeCookieUnsupported("Edge Local State 中没有可用的 DPAPI 密钥")
+    protected = base64.b64decode(encoded)
+    if not protected.startswith(b"DPAPI"):
+        raise EdgeCookieUnsupported("Edge 密钥不是当前用户 DPAPI 格式")
+    return _dpapi_unprotect(protected[5:])
+
+
+def _decrypt_edge_cookie(encrypted: bytes, host: str, master_key: bytes,
+                         meta_version: int) -> str:
+    """解开一个已筛选出的 Edge Cookie，不处理 App-Bound v20。"""
+    if encrypted.startswith(b"v20"):
+        raise EdgeCookieUnsupported(
+            "Edge 已启用 App-Bound Cookie 加密；本程序不会绕过该保护"
+        )
+    if encrypted.startswith((b"v10", b"v11")):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        raw = encrypted[3:]
+        if len(raw) < 12 + 16:
+            raise ValueError("Edge Cookie 密文长度异常")
+        try:
+            plaintext = AESGCM(master_key).decrypt(raw[:12], raw[12:], None)
+        except Exception as exc:
+            raise ValueError("Edge Cookie 解密失败") from exc
+        # Chromium Cookie DB schema v24+ 在明文前放 SHA-256(host_key)。
+        if meta_version >= 24:
+            expected = hashlib.sha256(host.encode("utf-8")).digest()
+            if len(plaintext) < 32 or plaintext[:32] != expected:
+                raise ValueError("Edge Cookie 域校验失败")
+            plaintext = plaintext[32:]
+        return plaintext.decode("utf-8")
+    return _dpapi_unprotect(encrypted).decode("utf-8")
+
+
+def _edge_sessdata_candidates(emit=None):
+    """只查询 Edge Cookie DB 中 bilibili.com 的 SESSDATA。"""
+    if sys.platform != "win32":
+        return []
+    localappdata = Path(os.environ.get("LOCALAPPDATA", ""))
+    user_data = localappdata / "Microsoft" / "Edge" / "User Data"
+    if not user_data.is_dir():
+        return []
+
+    try:
+        master_key = _edge_master_key(user_data)
+    except (OSError, ValueError, KeyError, json.JSONDecodeError,
+            EdgeCookieUnsupported) as exc:
+        if emit:
+            emit(f"[!] Edge 登录态不可读取：{exc}")
+        return []
+
+    now = int(time.time())
+    candidates = []
+    profiles = [user_data / "Default", *sorted(user_data.glob("Profile *"))]
+    for profile in profiles:
+        dbs = [profile / "Network" / "Cookies", profile / "Cookies"]
+        db = next((path for path in dbs if path.is_file()), None)
+        if not db:
+            continue
+        try:
+            try:
+                con = sqlite3.connect(
+                    db.resolve().as_uri() + "?mode=ro", uri=True, timeout=1
+                )
+                con.execute("PRAGMA query_only=ON")
+            except sqlite3.OperationalError:
+                # immutable 仍是只读且不会复制数据库；Edge 独占锁时可作为退路。
+                con = sqlite3.connect(
+                    db.resolve().as_uri() + "?mode=ro&immutable=1",
+                    uri=True, timeout=1,
+                )
+            try:
+                meta_row = con.execute(
+                    "SELECT value FROM meta WHERE key='version'"
+                ).fetchone()
+                meta_version = int(meta_row[0]) if meta_row else 0
+                rows = con.execute(
+                    "SELECT host_key, value, encrypted_value, expires_utc "
+                    "FROM cookies WHERE name='SESSDATA' "
+                    "AND host_key IN ('.bilibili.com', 'bilibili.com', "
+                    "'www.bilibili.com')"
+                ).fetchall()
+            finally:
+                con.close()
+
+            for host, value, encrypted, expires_utc in rows:
+                # Chromium 时间戳：自 1601-01-01 起的微秒数；0 表示会话 Cookie。
+                expiry = 0 if not expires_utc else int(
+                    int(expires_utc) / 1_000_000 - 11_644_473_600
+                )
+                if expiry and expiry <= now:
+                    continue
+                if not value and encrypted:
+                    value = _decrypt_edge_cookie(
+                        bytes(encrypted), host, master_key, meta_version
+                    )
+                if value:
+                    candidates.append(
+                        (expiry, db.stat().st_mtime, value,
+                         f"Edge ({profile.name})")
+                    )
+        except EdgeCookieUnsupported as exc:
+            if emit:
+                emit(f"[!] {profile.name}：{exc}；可改用 Firefox 登录。")
+        except (OSError, sqlite3.Error, ValueError, UnicodeError, ImportError) as exc:
+            if emit:
+                emit(f"[*] 跳过无法读取的 Edge 配置 {profile.name}: {exc}")
+    return candidates
+
+
+def import_browser_sessdata(emit=None, browser: str = "auto") -> tuple[str | None, str | None]:
+    """直接复用本机 Edge / Firefox 中的 B 站登录态。
+
+    Cookie 数据库以只读模式打开；SESSDATA 只返回给当前进程，不写入 BiliYTPlayer
+    的配置文件，也不打印到日志。返回 ``(sessdata, source)``；找不到可用登录态
+    时返回 ``(None, None)``。
+
+    ``browser`` 可取 ``auto``、``edge`` 或 ``firefox``。自动模式会比较两个浏览器
+    的有效候选，优先使用到期时间较晚、配置较新的登录态。
+    """
+    def _emit(msg):
+        if emit:
+            try:
+                emit(msg)
+            except Exception:
+                pass
+
+    browser = (browser or "auto").strip().casefold()
+    if browser not in {"auto", "edge", "firefox"}:
+        raise ValueError("browser 必须是 auto、edge 或 firefox")
+    candidates = []
+    if browser in {"auto", "edge"}:
+        candidates.extend(_edge_bridge_candidate())
+        candidates.extend(_edge_sessdata_candidates(_emit))
+    if browser in {"auto", "firefox"}:
+        candidates.extend(_firefox_sessdata_candidates(_emit))
+
+    if not candidates:
+        return None, None
+    _, _, value, source = max(candidates, key=lambda item: (item[0], item[1]))
+    return value, source
 
 def qr_login_sessdata(emit=None, draw_qr=None, on_status=None,
                       cancel=None, timeout: float = 180) -> str | None:
@@ -140,7 +472,7 @@ def qr_login_sessdata(emit=None, draw_qr=None, on_status=None,
 
     流程:
       generate 申请二维码 → 终端 ASCII 二维码（可同时交给 GUI 绘制）→
-      轮询 poll 直到授权成功 → 从 Set-Cookie 提取 SESSDATA → 保存到 .env。
+      轮询 poll 直到授权成功 → 从 Set-Cookie 提取 SESSDATA，仅在内存中返回。
 
     参数:
       emit:      日志回调（GUI 传入 self._log，终端走 print）
@@ -253,12 +585,7 @@ def qr_login_sessdata(emit=None, draw_qr=None, on_status=None,
                 _emit("[!] 登录成功但未解析到 SESSDATA，请重试。")
                 return None
 
-            ENV_PATH.write_text(
-                "# B 站登录态 Cookie — 扫码登录自动保存，请勿分享。\n"
-                "SESSDATA=" + sessdata + "\n",
-                encoding="utf-8",
-            )
-            _emit("[+] 扫码登录成功，SESSDATA 已保存到 .env。")
+            _emit("[+] 扫码登录成功；登录态仅在当前进程内存中使用。")
             if on_status:
                 try:
                     on_status("登录成功！")
@@ -289,18 +616,55 @@ def qr_login_sessdata(emit=None, draw_qr=None, on_status=None,
 # 3. 播放器检测（只找 mpv.exe：便携版 > 独立安装版 > PATH）
 # ============================================================================
 
+def _mpv_anime_candidates():
+    """返回本机 MPV Anime 的候选 mpv.exe，最新安装优先。"""
+    candidates = []
+
+    override = os.environ.get("BILIYT_MPV_PATH", "").strip().strip('"')
+    if override:
+        candidates.append(Path(override))
+
+    localappdata = Path(os.environ.get("LOCALAPPDATA", ""))
+    programfiles = Path(os.environ.get("ProgramFiles", ""))
+    candidates += [
+        localappdata / "Programs" / "MPV Anime" / "mpv.exe",
+        localappdata / "Programs" / "Anime-BD-Player" / "mpv" / "mpv.exe",
+        programfiles / "MPV Anime" / "mpv.exe",
+        programfiles / "Anime-BD-Player" / "mpv" / "mpv.exe",
+    ]
+
+    existing = []
+    seen = set()
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        key = str(resolved).casefold()
+        if key not in seen and resolved.is_file():
+            seen.add(key)
+            existing.append(resolved)
+    existing.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return existing
+
+
 def find_player():
-    """多级探测 mpv。优先级: 自带便携版 > 独立安装版 > PATH。
+    """多级探测 mpv。优先级: MPV Anime > 自带便携版 > 独立安装版 > PATH。
        返回 mpv.exe 绝对路径,找不到返 None。
     """
     drives = ["C:", "D:", "E:"]
 
-    # ---- 0. 最高优先: 自带便携版 mpv (开箱即用) ----
+    # ---- 0. 用户已安装的 MPV Anime（保留其 portable_config / 脚本 / 着色器） ----
+    anime = _mpv_anime_candidates()
+    if anime:
+        return str(anime[0])
+
+    # ---- 1. 自带便携版 mpv (开箱即用) ----
     bundled = _exe_dir / "mpv-portable" / "mpv.exe"
     if bundled.is_file():
         return str(bundled)
 
-    # ---- 1. 独立安装的 mpv（最新稳定版） ----
+    # ---- 2. 独立安装的 mpv（最新稳定版） ----
     # winget 安装路径
     standalone_mpv_paths = [
         os.path.join(d + os.sep, "Program Files", "MPV Player", "mpv.exe")
@@ -346,8 +710,11 @@ class _FastBiliSession:
         if params:
             path += "?" + urlencode(params)
         # timeout 必须透传：调用方（playurl=15s 等）的预算曾经被静默丢弃
+        cookie_header = "; ".join(
+            f"{key}={value}" for key, value in self._cookies.items() if value
+        )
         return _FastResponse(_fast_bili_api(
-            path, self._cookies.get("SESSDATA", ""), headers or {},
+            path, extra_headers=headers or {}, cookie_header=cookie_header,
             timeout=timeout if timeout else 10,
         ))
 
@@ -495,14 +862,15 @@ def _fast_https_once(host: str, path: str, cookie: str = "",
 
 
 def _fast_bili_api(path: str, sessdata: str = "", extra_headers: dict = None,
-                   timeout: float = 10) -> dict:
+                   timeout: float = 10, cookie_header: str | None = None) -> dict:
     """裸 socket HTTPS 请求 —— 绕过 urllib3/requests 的代理探测开销。
        本机 requests 库有链路问题（24s），裸 socket 100ms。仅用于 B站 API。
        保留原签名/原返回类型（dict），所有调用方无需改动。
     """
     header_text, body = _fast_https_request(
         "api.bilibili.com", path,
-        cookie=f"SESSDATA={sessdata}" if sessdata else "",
+        cookie=(cookie_header if cookie_header is not None
+                else (f"SESSDATA={sessdata}" if sessdata else "")),
         extra_headers=extra_headers,
         timeout=timeout,
     )
@@ -510,12 +878,11 @@ def _fast_bili_api(path: str, sessdata: str = "", extra_headers: dict = None,
 
 
 class SessdataInvalid(RuntimeError):
-    """SESSDATA 缺失/过期/无效（nav API 返回非 0）。仅此异常触发扫码重登，
-    网络类异常不得删除 .env——否则一次抖动就弄丢有效登录态。"""
+    """SESSDATA 缺失/过期/无效（nav API 返回非 0）。"""
 
 
 def init_bili_session(sessdata: str) -> tuple:
-    """初始化 B 站会话：单次 nav API 同时完成 SESSDATA 验证 + WBI 签名密钥获取。"""
+    """初始化 B 站会话并补齐公开设备标识，避免 view API 拒绝裸 Cookie 请求。"""
     # 裸 socket 直连 B站，绕过本机 requests 库的代理探测开销（24s → 0.1s）
     j = _fast_bili_api("/x/web-interface/nav", sessdata)
 
@@ -532,6 +899,18 @@ def init_bili_session(sessdata: str) -> tuple:
     # 创建快速 Session（裸 socket，绕过本机 requests 库的链路问题）
     session = _FastBiliSession()
     session.cookies.set("SESSDATA", sessdata, domain=".bilibili.com")
+
+    # 2026-11 起 /x/web-interface/view 会把只有 SESSDATA 的请求判为
+    # "request was banned"。从 B 站公开 SPI 接口获取匿名设备标识即可；
+    # 不需要再读取 Firefox 中的其他私人 Cookie。
+    spi = _fast_bili_api("/x/frontend/finger/spi")
+    spi_data = spi.get("data") or {}
+    buvid3, buvid4 = spi_data.get("b_3"), spi_data.get("b_4")
+    if spi.get("code") != 0 or not buvid3 or not buvid4:
+        raise RuntimeError(f"B站设备标识获取失败: {spi.get('message', 'unknown')}")
+    session.cookies.set("buvid3", buvid3, domain=".bilibili.com")
+    session.cookies.set("buvid4", buvid4, domain=".bilibili.com")
+    session.cookies.set("b_nut", str(int(time.time())), domain=".bilibili.com")
 
     return session, img_key, sub_key
 
@@ -1489,6 +1868,29 @@ def _cleanup_stale_cookie_files():
         pass
 
 
+def _player_config_dir(player_path: str) -> str | None:
+    """选择与播放器匹配的配置目录；MPV Anime 使用它自己的 portable_config。"""
+    adjacent = Path(player_path).resolve().parent / "portable_config"
+    if adjacent.is_dir():
+        return str(adjacent)
+    bundled = _exe_dir / "mpv-portable" / "portable_config"
+    return str(bundled) if bundled.is_dir() else None
+
+
+def _find_ytdlp(player_path: str) -> str | None:
+    """在当前播放器、BiliYT 便携目录和 PATH 中查找 yt-dlp。"""
+    choices = [
+        Path(player_path).resolve().parent / "yt-dlp.exe",
+        _exe_dir / "yt-dlp.exe",
+        _exe_dir / "mpv-portable" / "yt-dlp.exe",
+    ]
+    for path in choices:
+        if path.is_file():
+            return str(path)
+    found = which("yt-dlp") or which("yt-dlp.exe")
+    return found if found and os.path.isfile(found) else None
+
+
 def launch_player(player_path, video_url, title, audio_url=None, sessdata=None, log=None):
     """唤起 mpv 播放。B 站（有 sessdata）走 CDN 直链 + 鉴权头；YouTube（无 sessdata）走 ytdl_hook + 代理。
 
@@ -1504,18 +1906,19 @@ def launch_player(player_path, video_url, title, audio_url=None, sessdata=None, 
                 pass
         print(msg, flush=True)
 
-    portable_conf = str(_exe_dir / "mpv-portable" / "portable_config")
+    player_conf = _player_config_dir(player_path)
 
     # ── 公共参数 ──────────────────────────────────────────────────────────
     cmd = [
         player_path,
         video_url,
         f"--force-media-title={title}",
-        f"--config-dir={portable_conf}",
         "--log-file=" + str(_CONFIG_DIR / "mpv.log"),
         # MPV IPC：切集通道（命名管道，< / > 切集 + 播完自动下一集）
         f"--input-ipc-server={IPC_PIPE}",
     ]
+    if player_conf:
+        cmd += [f"--config-dir={player_conf}"]
 
     # 注入切集快捷键转发脚本（Lua，绑定 Ctrl+←/Ctrl+→ → 写信号文件）
     lua_script = str(_exe_dir / "bili-ipc.lua")
@@ -1542,11 +1945,11 @@ def launch_player(player_path, video_url, title, audio_url=None, sessdata=None, 
 
     # ── YouTube：ytdl_hook 解析 + 走系统代理 ──────────────────────────────
     else:
-        ytdlp_exe = str(_exe_dir / "mpv-portable" / "yt-dlp.exe")
-        if not os.path.isfile(ytdlp_exe):
-            _emit(f"    [!] 未找到 yt-dlp.exe: {ytdlp_exe}")
+        ytdlp_exe = _find_ytdlp(player_path)
+        if not ytdlp_exe:
+            _emit("    [!] 未找到 yt-dlp.exe")
             _emit(f"        请从 https://github.com/yt-dlp/yt-dlp/releases 下载 yt-dlp.exe")
-            _emit(f"        放到 mpv-portable/ 目录下与 BiliYTPlayer.exe 同级")
+            _emit(f"        放到 MPV Anime 的 mpv.exe 同级目录即可")
             return
         # 解析代理: 返回 (mpv_proxy, ytdlp_proxy), 处理 socks5/PAC 等边缘情况
         mpv_proxy, ytdlp_proxy = _resolve_proxy_url(_emit)

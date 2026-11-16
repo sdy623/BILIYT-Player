@@ -15,7 +15,9 @@ local function nav(dir)
     end
 end
 
-mp.add_key_binding("Ctrl+Left", "bili-prev-episode", function() nav("prev") end)
-mp.add_key_binding("Ctrl+Right", "bili-next-episode", function() nav("next") end)
+-- MPV Anime 的 input.conf 已把 Ctrl+←/→ 绑定为 5 分钟 seek。
+-- 这里必须强制覆盖，才能保证 BiliYTPlayer 的切集语义不被本地配置吞掉。
+mp.add_forced_key_binding("Ctrl+Left", "bili-prev-episode", function() nav("prev") end)
+mp.add_forced_key_binding("Ctrl+Right", "bili-next-episode", function() nav("next") end)
 
 mp.osd_message("BiliYTPlayer: Ctrl+← 上一集 / Ctrl+→ 下一集", 2)

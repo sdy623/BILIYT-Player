@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>BiliYT Session Bridge</title>
+  <style>
+    body { width: 300px; margin: 0; padding: 16px; font: 14px/1.5 system-ui, sans-serif; color: #202124; }
+    h1 { margin: 0 0 8px; font-size: 17px; }
+    p { margin: 6px 0 12px; color: #5f6368; }
+    input, button { box-sizing: border-box; width: 100%; padding: 9px 10px; border-radius: 7px; }
+    input { border: 1px solid #bdc1c6; margin-bottom: 8px; }
+    button { border: 0; background: #00aeec; color: white; font-weight: 650; cursor: pointer; }
+    #status { min-height: 21px; margin-top: 10px; color: #137333; }
+    .error { color: #b3261e !important; }
+  </style>
+</head>
+<body>
+  <h1>导入 Bilibili 登录态</h1>
+  <p>先启动 BiliYTPlayer，再粘贴软件复制的一次性配对码。</p>
+  <input id="token" type="password" autocomplete="off" placeholder="一次性配对码">
+  <button id="send" type="button">导入到本机播放器</button>
+  <div id="status" role="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

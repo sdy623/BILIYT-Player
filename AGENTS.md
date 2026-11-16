@@ -12,8 +12,9 @@ Python（`bili_yt_player.pyw` GUI + 剪贴板监听；`bili_clipboard_dolby.py` 
 ## 硬约束（都是踩过坑才写下的）
 
 1. **画面 / 色彩 / 快捷键 / 音频一律改 mpv 侧**：`mpv.conf`、`input.conf`、Lua。
-   禁止在 Python 里造轮子或引入新 UI 库。唯一例外：启动时经 `launch_player` 的
-   `cmd` 列表传 CLI 参数（命令行覆盖同名选项）。
+   播放器禁止在 Python 里造轮子或引入新 UI 库。例外：独立的
+   `BiliMKVDownloader.exe` 使用 Edge WebView2 桌面壳；启动播放器时仍只允许经
+   `launch_player` 的 `cmd` 列表传 CLI 参数（命令行覆盖同名选项）。
 2. **`mpv.conf` 全局选项必须写在第一个 `[profile]` 段头之前**。写进段里会静默
    失效——曾导致 `keep-open` / `cache` / `hwdec` 全失效、自动连播不工作。
 3. **Lua 的 `string.match` 不支持 `|` 交替**，`"flac|aac"` 永远匹配不到；

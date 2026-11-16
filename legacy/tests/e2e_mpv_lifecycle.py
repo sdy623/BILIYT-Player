@@ -55,7 +55,7 @@ SRC = "av://lavfi:testsrc=duration=120"
 # ---- 场景1：首次起播（无残留）----
 log1 = []
 t0 = time.time()
-D.launch_player(player, SRC, "B4-TEST-1", log=log1.append)
+D.launch_player(player, SRC, "B4-TEST-1", sessdata="E2E", log=log1.append)
 dt1 = time.time() - t0
 print(f"  场景1 日志: {[l.strip() for l in log1]}", flush=True)
 check("首次起播管道建立", pipe_ok(), f"耗时{dt1:.1f}s")
@@ -64,7 +64,7 @@ check("首次起播无残留告警", not any("没能清退" in l for l in log1),
 # ---- 场景2：再起一次（模拟用户换链接，旧 mpv 必须被清退）----
 log2 = []
 t0 = time.time()
-D.launch_player(player, SRC, "B4-TEST-2", log=log2.append)
+D.launch_player(player, SRC, "B4-TEST-2", sessdata="E2E", log=log2.append)
 dt2 = time.time() - t0
 print(f"  场景2 日志: {[l.strip() for l in log2]}", flush=True)
 n = mpv_count()
@@ -82,7 +82,7 @@ check("能定位本软件 mpv 的 PID", len(pids) == 1, f"pids={pids}（当前 m
 
 # ---- 场景5：mpv 卡死不响应 quit → 走强杀，且如实报告"没清干净" ----
 # 造一个真 mpv 占住管道，再把 _pipe_open 卡成"永远显示被占"，模拟不响应 quit
-D.launch_player(player, SRC, "B4-STUCK", log=lambda m: None)
+D.launch_player(player, SRC, "B4-STUCK", sessdata="E2E", log=lambda m: None)
 time.sleep(1)
 before = mpv_count()
 real_open, real_close = D._pipe_open, D._pipe_close
@@ -116,7 +116,7 @@ if made:
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     time.sleep(1.5)
-    D.launch_player(player, SRC, "B4-MINE", log=lambda m: None)
+    D.launch_player(player, SRC, "B4-MINE", sessdata="E2E", log=lambda m: None)
     time.sleep(1.5)
     n_all = mpv_count()
     pids = D._our_mpv_pids()

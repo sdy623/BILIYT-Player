@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Bili RAW 下载器</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32"><path d="M7 5h18v22H7zM11 10h10M11 15h10M11 20h6"/></svg>
+      </div>
+      <div>
+        <h1>Bili RAW 下载器</h1>
+        <p class="app-subtitle">粘贴链接，选择目录，然后开始下载</p>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero-grid" aria-label="下载设置">
+        <form id="download-form" class="download-panel">
+          <div class="section-heading">
+            <div>
+              <h2>下载内容</h2>
+              <p>支持视频、番剧、分 P 和空间合集链接</p>
+            </div>
+            <span class="supported-types">BV · EP · SS · MD</span>
+          </div>
+
+          <label for="source-input">视频或合集链接</label>
+          <div class="input-shell source-shell">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M10.6 13.4a5 5 0 0 0 7.1 0l2.1-2.1a5 5 0 0 0-7.1-7.1l-1.2 1.2M13.4 10.6a5 5 0 0 0-7.1 0l-2.1 2.1a5 5 0 0 0 7.1 7.1l1.2-1.2"/></svg>
+            <input id="source-input" name="source" type="text" autocomplete="off" spellcheck="false" placeholder="https://www.bilibili.com/video/BV…">
+          </div>
+
+          <label for="output-input">保存到</label>
+          <div class="directory-row">
+            <div class="input-shell">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 6h7l2 2h9v10H3z"/></svg>
+              <input id="output-input" name="output" type="text" spellcheck="false">
+            </div>
+            <button id="browse-button" class="secondary-button" type="button">选择目录</button>
+          </div>
+
+          <div class="format-strip" aria-label="下载和封装方式">
+            <div class="format-item">
+              <span>视频</span>
+              <strong>最高画质</strong>
+              <small>包括可用的 Dolby Vision</small>
+            </div>
+            <div class="format-item">
+              <span>音频</span>
+              <strong>自动选择</strong>
+              <small>Hi-Res、Atmos 或普通音频</small>
+            </div>
+            <div class="format-item">
+              <span>文件</span>
+              <strong>MKV</strong>
+              <small>只封装，不转码</small>
+            </div>
+          </div>
+
+          <div class="action-row">
+            <button id="download-button" class="primary-button" type="submit">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v12m0 0 5-5m-5 5-5-5M4 20h16"/></svg>
+              <span>开始下载</span>
+            </button>
+            <button id="open-button" class="ghost-button" type="button" disabled>打开文件夹</button>
+          </div>
+          <p id="form-error" class="form-error" role="alert"></p>
+        </form>
+
+        <aside class="quality-panel" aria-label="下载规则">
+          <h2>下载规则</h2>
+          <p class="quality-intro">程序按视频实际提供的格式下载，不会补造不存在的音轨。</p>
+          <ul class="quality-list">
+            <li>
+              <span class="quality-icon cyan" aria-hidden="true">V</span>
+              <div><strong>视频</strong><small>选择最高质量；遇到 DV 时保留配置和 RPU。</small></div>
+            </li>
+            <li>
+              <span class="quality-icon amber" aria-hidden="true">A</span>
+              <div><strong>音频</strong><small>Hi-Res 和 Atmos 有则保留，否则使用最高码率普通音频。</small></div>
+            </li>
+            <li>
+              <span class="quality-icon mint" aria-hidden="true">✓</span>
+              <div><strong>成品</strong><small>封装完成后检查视频、编码和音轨数量。</small></div>
+            </li>
+          </ul>
+          <div class="privacy-note">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 11V8a5 5 0 0 1 10 0v3M5 11h14v10H5z"/></svg>
+            <p><strong>登录状态只读</strong><span>读取 Edge 或 Firefox 的现有登录；不会把 Cookie 写入配置或日志。</span></p>
+          </div>
+        </aside>
+      </section>
+
+      <section id="progress-section" class="progress-section" aria-live="polite">
+        <div class="progress-copy">
+          <div>
+            <h2>下载进度</h2>
+            <p id="status-title">尚未开始</p>
+          </div>
+          <span id="progress-metric">0%</span>
+        </div>
+        <div id="progress-bar" class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <span id="progress-fill"></span>
+        </div>
+        <div class="progress-meta">
+          <span id="progress-detail">粘贴链接后即可开始</span>
+          <span id="progress-size"></span>
+        </div>
+      </section>
+
+      <section class="log-panel">
+        <div class="log-header">运行记录</div>
+        <div id="activity-log" class="activity-log" role="log" aria-live="polite" aria-relevant="additions">
+          <p><time>就绪</time><span>普通视频可以下载；Hi-Res、Dolby Vision 和 Atmos 有则保留。</span></p>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,4 +1,4 @@
-# B 站扫码登录链路 E2E 回归测试（2026-10-30 首建，B-2/B-3 修复时）
+# B 站浏览器直接登录 + 旧扫码窗回归测试
 # ============================================================================
 # 验证扫码窗的两个硬要求：
 #   B-2 失败/取消必须给出原因 + 可重试，不再"程序一闪就没"
@@ -13,12 +13,12 @@
 #   场景B2 后端报了具体原因    → 原因要出现在弹窗正文里
 #   场景C  成功                → ("FAKE_SD", None)，且二维码真的画在主线程
 #   场景D  线程卡死 + 用户取消 → 1.5s 内强制收场（绝不假死）
-#   场景E  冷启动失败 + 不重试 → SystemExit(0)
-#   场景F  冷启动失败 → 重试 → 第二次成功 → 进入主流程
+#   场景E  浏览器无登录 + 不重试 → SystemExit(0)
+#   场景F  浏览器无登录 → 重试 → 第二次读取成功 → 进入主流程
 #
 # 注意：
 #   - 跑的过程中会在屏幕上短暂闪现扫码窗，属正常（窗口要真实存在才能验证绘制）。
-#   - 真实登录态不会被动：冷启动场景把 .env 指向临时目录，测完即删。
+#   - 所有浏览器读取均被 mock；绝不访问或打印真实 Cookie。
 #   - 不要和 e2e_interaction.py 混跑（后者会 taskkill 清场）。
 # ============================================================================
 import os, sys, time, threading
@@ -127,12 +127,10 @@ run_case("卡死+取消→1.5s强制收场", lambda *a, **k: (time.sleep(60), No
          lambda sd, err: sd is None and err is None,
          extra_pre=click_cancel, budget=5)
 
-# ---- 以下用真实 App 冷启动路径，验证 B-2 的「原因 + 重试」闭环 ----
-import pathlib
-_TMP_ENV = pathlib.Path(ROOT) / ".workbuddy" / "tmp_login_env" / ".env"
+# ---- 以下走真实 App 冷启动控制流，但浏览器导入与网络初始化均 mock ----
 SHOWN = []          # 记录弹窗 (标题, 正文)
 ANSWERS = []        # 用户对"是否重试"的回答队列
-QR_RESULTS = []     # 每次扫码的结果队列
+LOGIN_RESULTS = []  # 每次浏览器读取的 (sessdata, source)
 
 
 def _fake_ask(title, msg, **k):
@@ -140,55 +138,46 @@ def _fake_ask(title, msg, **k):
     return ANSWERS.pop(0) if ANSWERS else False
 
 
-def cold_start(answers, qr_results):
-    """构造真 App（冷启动：无 SESSDATA），走完整的 __init__ 扫码循环。"""
-    _TMP_ENV.parent.mkdir(parents=True, exist_ok=True)
-    if _TMP_ENV.exists():
-        _TMP_ENV.unlink()
-    G.ENV_PATH = _TMP_ENV
-    D.ENV_PATH = _TMP_ENV
-    SHOWN.clear(); ANSWERS[:] = answers; QR_RESULTS[:] = qr_results
-    D.qr_login_sessdata = lambda *a, **k: (QR_RESULTS.pop(0) if QR_RESULTS else None)
+def cold_start(answers, login_results):
+    """构造真 App，浏览器 Cookie 与后续网络初始化全部使用假对象。"""
+    SHOWN.clear(); ANSWERS[:] = answers; LOGIN_RESULTS[:] = login_results
+    D.import_browser_sessdata = lambda *a, **k: (
+        LOGIN_RESULTS.pop(0) if LOGIN_RESULTS else (None, None)
+    )
     G.messagebox.askretrycancel = _fake_ask
+    G.App._show_status_page = lambda self: None
     return G.App()
 
 
-print("场景E：冷启动扫码失败 + 用户选择不重试（B-2 告别一闪而过）", flush=True)
+print("场景E：浏览器无登录 + 用户选择不重试", flush=True)
 t0 = time.time()
 try:
-    cold_start([False], [None])
+    cold_start([False], [(None, None)])
     check("失败后应 SystemExit 而非假死", False, "没抛 SystemExit（说明卡在循环里了）")
 except SystemExit as e:
     dt = time.time() - t0
-    check("失败→弹原因→退出", e.code == 0 and len(SHOWN) == 1,
+    check("无登录→提示→退出", e.code == 0 and len(SHOWN) == 1,
           f"SystemExit({e.code}) 弹窗次数={len(SHOWN)} 耗时={dt:.1f}s")
     if SHOWN:
         title, msg = SHOWN[0]
-        check("弹窗说清了原因", "失败" in title and "登录未完成" in msg,
+        check("弹窗说明支持的浏览器", "未检测到" in title and "Edge 或 Firefox" in msg,
               f"标题={title!r} 正文={msg.splitlines()[0]!r}")
 
-print("场景F：冷启动失败 → 用户重试 → 第二次成功（B-2 重试闭环）", flush=True)
+print("场景F：浏览器无登录 → 用户重试 → 第二次读取成功", flush=True)
 t0 = time.time()
 try:
-    app = cold_start([True], [None, "FAKE_SD2"])
+    app = cold_start([True], [(None, None), ("FAKE_SD2", "Edge (Default)")])
     dt = time.time() - t0
     check("重试后成功进入主流程", app.sessdata == "FAKE_SD2",
-          f"sessdata={app.sessdata!r} 扫码次数={2} 耗时={dt:.1f}s")
-    check("失败弹窗先出现过", len(SHOWN) == 1 and "失败" in SHOWN[0][0],
+          f"来源={app.login_source!r} 读取次数=2 耗时={dt:.1f}s")
+    check("无登录提示先出现过", len(SHOWN) == 1 and "未检测到" in SHOWN[0][0],
           f"弹窗={SHOWN[0][0]!r}" if SHOWN else "无弹窗")
     app.root.destroy()
 except SystemExit as e:
     check("重试后成功进入主流程", False, f"不该退出，却 SystemExit({e.code})")
 
-# 清理冷启动场景造的临时 .env，别把假的登录态留下
-try:
-    if _TMP_ENV.exists():
-        _TMP_ENV.unlink()
-    _TMP_ENV.parent.rmdir()
-except Exception:
-    pass
-
 print("\n" + "=" * 46, flush=True)
 fails = sum(1 for _, ok in results if not ok)
 print(f"===== 汇总：{len(results)-fails}/{len(results)} PASS =====", flush=True)
+D.stop_edge_session_bridge()
 sys.exit(1 if fails else 0)

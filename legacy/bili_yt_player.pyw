@@ -3,7 +3,7 @@
 """
 bili_yt_player.pyw — 剪贴板直连播放器 GUI
 
-双击启动：首次输入 SESSDATA，之后最小化到后台，复制 B 站/YouTube 链接即播。
+双击启动：直接复用 Edge / Firefox 的 B 站登录态，复制链接即播。
 """
 
 import sys
@@ -21,7 +21,6 @@ from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from datetime import datetime
 import subprocess as sp
-from dotenv import load_dotenv
 import app_log  # 本地开发日志：源码运行写盘，打包 exe 自动静默
 import version  # VERSION / WINDOW_TITLE 的唯一来源
 
@@ -67,7 +66,6 @@ else:
     _exe_dir = Path(__file__).resolve().parent
 _CONFIG_DIR = Path(os.environ.get("APPDATA", str(_exe_dir))) / "BiliYTPlayer"
 _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-ENV_PATH = _CONFIG_DIR / ".env"
 BV_RE = re.compile(r"(BV[a-zA-Z0-9]{10})")
 YT_RE = re.compile(r"(?:youtube\.com/(?:watch\?v=|shorts/|live/)|youtu\.be/)([a-zA-Z0-9_-]{11})")
 EP_RE = re.compile(r"/ep(\d+)")
@@ -93,34 +91,43 @@ class App:
             pass
 
         self.sessdata = None
+        self.login_source = None
         self.running = False
         self.task_queue: queue.Queue = queue.Queue()
         self.recent_ids: deque[str] = deque(maxlen=20)
 
-        if ENV_PATH.exists():
-            load_dotenv(ENV_PATH)
-            self.sessdata = os.getenv("SESSDATA", "").strip() or None
-
         self._build_ui()
 
+        # 直接复用 Edge / Firefox 已登录的 B 站会话；Cookie 只进内存。
+        from bili_clipboard_dolby import import_browser_sessdata, start_edge_session_bridge
+        self.edge_bridge_token = start_edge_session_bridge(emit=self._log)
+        self.sessdata, self.login_source = import_browser_sessdata(emit=self._log)
+
         if not self.sessdata:
-            # 无 SESSDATA → 弹窗扫码登录（阻塞主线程直到完成/取消/失败）
-            # B-2（2026-10-27 修）：失败/取消都不再静默退出——说明原因 + 给重试。
-            # 原来这里拿到 None 就直接 sys.exit(0)，用户看到的是"程序一闪就没"。
-            self.sessdata, login_err = self._qr_login_window()
+            # 不再显示二维码：让用户在浏览器用官方登录方式完成登录后重试。
             while not self.sessdata:
-                if login_err:
-                    retry = messagebox.askretrycancel(
-                        "B 站登录失败",
-                        f"{login_err}\n\n（常见原因：网络不通、B 站接口暂时不可用）\n\n是否重试？")
-                else:
-                    retry = messagebox.askretrycancel(
-                        "未登录",
-                        "你取消了扫码登录。\n未登录时 B 站链接无法播放。\n\n是否重新扫码？")
+                edge_hint = ""
+                if self.edge_bridge_token:
+                    try:
+                        self.root.clipboard_clear()
+                        self.root.clipboard_append(self.edge_bridge_token)
+                        edge_hint = (
+                            "\n\nEdge 127+ 用户：加载 extras/edge-session-bridge 扩展，"
+                            "配对码已复制到剪贴板；在扩展里粘贴并点击导入。"
+                        )
+                    except Exception:
+                        pass
+                retry = messagebox.askretrycancel(
+                    "未检测到 B 站登录",
+                    "请先在 Edge 或 Firefox 打开 bilibili.com 并完成登录，"
+                    "然后回到这里点击“重试”。"
+                    + edge_hint
+                    + "\n\n不会显示二维码，也不会复制或另存你的登录 Cookie。",
+                )
                 if not retry:
                     self.root.destroy()
                     sys.exit(0)
-                self.sessdata, login_err = self._qr_login_window()
+                self.sessdata, self.login_source = import_browser_sessdata(emit=self._log)
 
         # 后台线程做 SESSDATA 校验+初始化,避免网络阻塞 GUI
         self._show_status_page()
@@ -162,7 +169,13 @@ class App:
         self.refresh_btn = ttk.Button(btn_frame, text="刷新监听", command=self.refresh_monitor)
         self.refresh_btn.pack(side="left")
 
-        ttk.Button(btn_frame, text="重新登录", command=self._relogin).pack(side="left", padx=6)
+        ttk.Label(btn_frame, text="登录:").pack(side="left", padx=(8, 2))
+        self.login_browser_var = tk.StringVar(value="自动")
+        ttk.Combobox(
+            btn_frame, textvariable=self.login_browser_var,
+            values=("自动", "Edge", "Firefox"), state="readonly", width=7,
+        ).pack(side="left")
+        ttk.Button(btn_frame, text="刷新浏览器登录", command=self._relogin).pack(side="left", padx=6)
 
         ttk.Button(btn_frame, text="退出", command=self._quit).pack(side="right")
 
@@ -197,21 +210,23 @@ class App:
         self.hist_text.configure(state="disabled")
 
     def _relogin(self):
-        """运行中手动重新登录（换账号/登录态异常时用）。
-
-        弹扫码 → 成功后后台线程热替换会话：不重启应用、不丢剪贴板监听。
-        取消或失败则原登录态原样保留。启动时因网络异常没进监听态的，
-        重新登录成功后自动恢复监听。
-        """
-        from bili_clipboard_dolby import init_bili_session
-        self._log("[*] 正在打开扫码登录…")
-        sd, err = self._qr_login_window()
+        """重新读取指定浏览器登录态并热替换会话，不重启、不扫码。"""
+        from bili_clipboard_dolby import import_browser_sessdata, init_bili_session
+        selected = self.login_browser_var.get()
+        browser = {"Edge": "edge", "Firefox": "firefox"}.get(selected, "auto")
+        if browser == "edge" and self.edge_bridge_token:
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(self.edge_bridge_token)
+                self._log("[*] Edge 扩展一次性配对码已复制到剪贴板。")
+            except Exception:
+                pass
+        self._log(f"[*] 正在读取 {selected} 的 B 站登录态…")
+        sd, source = import_browser_sessdata(emit=self._log, browser=browser)
         if not sd:
-            # B-2（2026-10-27 修）：区分"取消"与"失败"，失败要把原因说出来
-            self._log(f"[!] 重新登录失败：{err}" if err
-                      else "[*] 已取消重新登录，当前登录态保持不变。")
+            self._log(f"[!] {selected}中没有可用的 B 站登录态；当前会话保持不变。")
             return
-        self._log("[*] 扫码成功，正在验证新登录态…")
+        self._log(f"[*] 已读取 {source}，正在验证登录态…")
 
         def do_init():
             try:
@@ -220,8 +235,9 @@ class App:
                 self._log(f"[!] 新登录态验证失败，继续使用原登录态: {e}")
                 return
             self.sessdata = sd
+            self.login_source = source
             self.session, self.img_key, self.sub_key = session, img_key, sub_key
-            self._log("[+] 重新登录成功，B 站鉴权已切换。")
+            self._log(f"[+] 已直接登录：{source}。")
             # 同步切集上下文：否则换账号后 Ctrl+←→/自动连播仍用旧 session 调 API
             try:
                 from bili_clipboard_dolby import _EPISODE_STATE
@@ -413,42 +429,34 @@ class App:
 
         self.player_path = player_path
         self._log(f"[+] 播放器: {player_path}")
+        if "anime-mpv-libredrive" in player_path.casefold() or "mpv anime" in player_path.casefold():
+            self._log("[+] 已接入本机 MPV Anime 配置、脚本与着色器。")
 
         # ---- B 站鉴权（单次 nav API 完成验证 + WBI 密钥获取） ----
         self._log("[*] B 站鉴权… 连接B站API")
 
         try:
             self.session, self.img_key, self.sub_key = init_bili_session(self.sessdata)
-            self._log("[+] B 站鉴权就绪。")
+            self._log(f"[+] B 站直接登录成功：{self.login_source or '已有登录态'}。")
         except SessdataInvalid as e:
-            # 仅"登录态无效"才删 .env 跳扫码；网络异常不删（见 SessdataInvalid 注释）
             self._log(f"[!] B 站鉴权失败: {e}")
-            self._log("[*] SESSDATA 已过期，正在弹出扫码登录…")
-            ENV_PATH.unlink(missing_ok=True)
-            # 弹窗必须在主线程，后台线程等待结果
-            done = threading.Event()
-            holder = {}
-
-            def do_login():
-                holder["sd"], holder["err"] = self._qr_login_window()
-                done.set()
-
-            self.root.after(0, do_login)
-            done.wait(timeout=240)  # 最多等 4 分钟（二维码有效期 + 轮询超时）
-            self.sessdata = holder.get("sd")
-            if not self.sessdata:
-                self._log(f"[!] 扫码登录未完成: {holder.get('err') or '用户取消'}")
-                self.root.after(0, self._quit)
+            from bili_clipboard_dolby import import_browser_sessdata
+            fresh_sd, source = import_browser_sessdata(emit=self._log)
+            if not fresh_sd or fresh_sd == self.sessdata:
+                self._log("[!] 浏览器登录态已失效；请在 Edge 或 Firefox 重新登录 B 站后，"
+                          "点击“刷新浏览器登录”。")
+                self.root.after(0, lambda: self.refresh_btn.configure(state="disabled"))
                 return
+            self.sessdata, self.login_source = fresh_sd, source
             try:
                 self.session, self.img_key, self.sub_key = init_bili_session(self.sessdata)
-                self._log("[+] B 站鉴权就绪。")
+                self._log(f"[+] B 站直接登录成功：{source}。")
             except Exception as e2:
-                self._log(f"[!] B 站鉴权仍然失败: {e2}")
+                self._log(f"[!] 浏览器登录态验证失败: {e2}")
                 self.root.after(0, lambda: self.refresh_btn.configure(state="disabled"))
                 return
         except Exception as e:
-            # 网络类异常：保留 .env（登录态还有效），B 站暂不可用，YouTube 不受影响
+            # 网络类异常：内存登录态仍有效，B 站暂不可用，YouTube 不受影响
             self._log(f"[!] B 站 API 网络异常，登录态已保留: {e}")
             self._log("[*] 检查网络后重启即可；B 站链接暂不可播放，YouTube 不受影响。")
             self.root.after(0, lambda: self.refresh_btn.configure(state="disabled"))
@@ -632,6 +640,11 @@ class App:
     # ---------- 退出 ----------
     def _quit(self):
         self.running = False
+        try:
+            from bili_clipboard_dolby import stop_edge_session_bridge
+            stop_edge_session_bridge()
+        except Exception:
+            pass
         self.root.destroy()
         sys.exit(0)
 
@@ -685,12 +698,23 @@ def _ensure_single_instance():
     if sys.platform != "win32":
         return
     import ctypes
-    kernel32 = ctypes.windll.kernel32
+    from ctypes import wintypes
+    # use_last_error=True + 显式 restype：默认 c_int 会在 64 位系统截断 HANDLE，
+    # 直接 GetLastError 也可能读到之前 Win32 调用留下的 183，导致首次启动被误判
+    # 成“已有实例”并立刻 exit(0)。
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
     ERROR_ALREADY_EXISTS = 183
+    ctypes.set_last_error(0)
     # 句柄存到全局，随进程生命周期存在；进程退出后由系统回收
     global _INSTANCE_MUTEX
     _INSTANCE_MUTEX = kernel32.CreateMutexW(None, False, "Local\\BiliYTPlayer_SingleInstance")
-    if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+    if not _INSTANCE_MUTEX:
+        app_log.log(f"[!] 单实例锁创建失败，继续启动: WinError={ctypes.get_last_error()}")
+        return
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        app_log.log("[*] 已有 BiliYTPlayer 实例，当前进程退出。")
         try:
             user32 = ctypes.windll.user32
             hwnd = user32.FindWindowW(None, version.WINDOW_TITLE)

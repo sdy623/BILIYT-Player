@@ -14,6 +14,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 .venv/
+.venv-tk/
 venv/
 env/
 *.egg-info/
@@ -36,6 +37,11 @@ mpv-portable/
 # ── 日志 / 运行时数据 ─────────────────────────────────────────────────────────
 *.log
 mpv.log
+downloads/
+outputs/
+config/watch_later/
+retry_BV*.py
+run_collection_*.py
 
 # ── 开发调试残留归档（确认无用后可整个删除）──────────────────────────────────
 _debug_archive/

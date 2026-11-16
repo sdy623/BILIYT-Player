@@ -1,6 +1,6 @@
 # BiliYTPlayer — 剪贴板直连播放器
 
-> 复制 B 站 / YouTube 链接到剪贴板，自动用内置 mpv 播放。
+> 复制 B 站 / YouTube 链接到剪贴板，自动用本机 MPV Anime 播放。
 > 支持 B 站 DASH 直链、杜比视界、HDR 动态映射、YouTube 最高 4K 流。
 
 ## 架构
@@ -19,24 +19,26 @@ config/input.conf       mpv 快捷键配置（参考副本）
 
 ## 使用
 
-1. 从 **Releases** 下载二进制包（包含 `BiliYTPlayer.exe` + `mpv-portable/`）
+1. 在 Edge 或 Firefox 中登录 B 站，同时准备好本机 MPV Anime
 2. 解压后双击 `BiliYTPlayer.exe`
 3. 复制 B 站 / YouTube 视频链接到剪贴板，自动播放
 4. 按 `q` 退出，`f` 全屏，`` ` `` 查看渲染统计（mpv 默认快捷键见 `config/input.conf`）
 
 可选（一键唤起）：安装 [`extras/biliyt-link/`](extras/biliyt-link/) 配套组件——网页端装油猴脚本、本机装 `biliyt://` 转发器，在 B 站 / YouTube 视频页点一下 ▶ 按钮就直接唤起播放，不用手动复制网址。三步安装见该目录 README。脚本沿用旧名称「⚡ BiliYTPlayer 一键 MPV 播放」，装过旧版的直接覆盖安装即可升级。
 
+### 下载 RAW 原始流
+
+需要保存原始流时，使用独立的 WebView2 `BiliRawDownloader.exe`：粘贴链接后，它会下载接口返回的最高质量视频，并按实际可用内容保留普通音频、Hi-Res/FLAC、Dolby Atmos，支持普通、仅 Hi-Res、仅 Dolby Vision（配普通音频）、Hi-Res + Dolby Vision 四种组合。下载依次尝试 aria2、GNU Wget2（若已安装）和内置 Python/OpenSSL 多连接实现；封装全程不转码。普通视频使用 FFmpeg `-c copy`，检测到 `dvh1`/`dvhe` Dolby Vision 时自动改用 MKVToolNix，保留 DV 配置与 RPU。空间合集链接会按顺序批量下载。详见 [`legacy/BILI_RAW_DOWNLOADER.md`](legacy/BILI_RAW_DOWNLOADER.md)。
+
 ### 从源码运行
 
 ```bash
-# 1. 准备 mpv-portable（从 Releases 下载，或自行安装 mpv + yt-dlp）
-#    目录结构：mpv-portable/mpv.exe、mpv-portable/yt-dlp.exe、mpv-portable/portable_config/
+# 1. 准备本机 MPV Anime；程序会优先自动探测其 mpv.exe 与 portable_config
 
 # 2. 安装依赖
 pip install -r requirements.txt
 
-# 3. B 站登录：首次启动会弹出二维码，用 B 站 App 扫码即可
-#    凭证自动保存到 %APPDATA%/BiliYTPlayer/.env，无需手工填写
+# 3. B 站登录：直接复用 Edge / Firefox 已登录的会话，不显示二维码，也不另存 Cookie
 
 # 4. 运行
 pythonw legacy/bili_yt_player.pyw
@@ -89,7 +91,9 @@ cd legacy
 
 ## 敏感信息声明
 
-仓库不含任何账号凭证。B 站登录态由扫码登录自动保存到用户目录 `%APPDATA%/BiliYTPlayer/.env`，不随仓库分发，请勿分享该文件。播放时凭证通过 HTTP 请求头直接传给 mpv，不写入临时文件。
+仓库不含任何账号凭证。B 站登录态仅从本机 Edge / Firefox 的 Cookie 数据库中读取 `bilibili.com` 的 `SESSDATA`，只在当前进程内存中使用；不会复制完整 Cookie 库，不会写入项目目录、临时 Cookie 文件或新的凭证文件。播放时凭证通过 HTTP 请求头直接传给 mpv。
+
+Edge 使用当前 Windows 用户的 DPAPI/AES-GCM 保护。Edge 127+ 启用 App-Bound（`v20`）时，本程序不会绕过该保护；请加载 [`extras/edge-session-bridge/`](extras/edge-session-bridge/) 扩展，通过 Edge 官方 Cookie API 和一次性配对码导入。Firefox 可直接只读导入。登录来源可在主窗口选择“自动 / Edge / Firefox”。
 
 ## 环境要求
 

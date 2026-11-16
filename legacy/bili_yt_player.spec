@@ -27,6 +27,10 @@ _hidden_imports = [
     "charset_normalizer",
     "certifi",
     "idna",
+    # Edge Cookie 使用当前 Windows 用户的 DPAPI 密钥 + AES-GCM；仅解开
+    # bilibili.com 的 SESSDATA，且明文不落盘。
+    "cryptography",
+    "cryptography.hazmat.primitives.ciphers.aead",
 ]
 
 # ---- 需要随 exe 一起打包的数据文件 ----
